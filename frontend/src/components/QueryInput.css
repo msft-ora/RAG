@@ -1,0 +1,89 @@
+.query-input-container {
+  margin-bottom: 30px;
+}
+
+.query-form {
+  margin-bottom: 20px;
+}
+
+.input-group {
+  display: flex;
+  gap: 10px;
+}
+
+.query-input {
+  flex: 1;
+  padding: 12px 16px;
+  font-size: 16px;
+  border: 2px solid #ddd;
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.query-input:focus {
+  outline: none;
+  border-color: #0066cc;
+  box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1);
+}
+
+.query-input:disabled {
+  background: #f5f5f5;
+  color: #ccc;
+}
+
+.query-button {
+  padding: 12px 24px;
+  background: #0066cc;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.query-button:hover:not(:disabled) {
+  background: #0052a3;
+}
+
+.query-button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+
+.examples {
+  padding: 15px;
+  background: #f0f7ff;
+  border-radius: 4px;
+  border-left: 4px solid #0066cc;
+}
+
+.examples p {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  color: #666;
+  font-weight: 600;
+}
+
+.example-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.example-btn {
+  padding: 6px 12px;
+  background: white;
+  border: 1px solid #0066cc;
+  color: #0066cc;
+  border-radius: 3px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.example-btn:hover {
+  background: #0066cc;
+  color: white;
+}

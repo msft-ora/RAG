@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MSSQL_SERVER=${MSSQL_SERVER:-localhost}
+      - MSSQL_DATABASE=${MSSQL_DATABASE:-master}
+      - MSSQL_USER=${MSSQL_USER:-sa}
+      - MSSQL_PASSWORD=${MSSQL_PASSWORD:?error}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?error}
+      - WHITELISTED_TABLES=${WHITELISTED_TABLES:-}
+    volumes:
+      - ./backend/chroma_db:/app/chroma_db
+    networks:
+      - rag-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
