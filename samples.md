@@ -1,0 +1,10 @@
+{"feature_name": "1_HR_MRCH_CH_RISK",
+ "partition_col": ["DRVD_MRCH_ID", "CHANNEL_CD"],
+ "col_exp": col("WEIGHT") * col("BAD_PIN_ATTMPT_IND"),
+ "window_seconds": 3600},
+
+{"feature_name": "30M_CH_FAIL_CNT",
+ "partition_col": "CHANNEL_CD",
+ "col_exp": when(col("STATUS") == "FAIL", 1),
+ "window_seconds": 1800,
+ "agg": "count"},
