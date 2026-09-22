@@ -1,0 +1,83 @@
+from pyspark.sql import functions
+import re
+def compute_trailing_window_features(df, specs, ts_col="TRANS_DT", id_col="_row_id", ts_long_col="_ts_long"):
+    spark = df.sparkSession
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+    spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
+    if id_col not in df.columns:
+        base_df = df.withColumn(id_col, functions.monotonically_increasing_id())
+    else:
+        base_df = df
+    base_df = base_df.withColumn(ts_long_col, functions.col(ts_col).cast("timestamp").cast("long")).cache()
+    groups = {}
+    for spec in specs:
+        p_cols = spec["partition_col"]
+        if isinstance(p_cols, str):
+            p_cols = [p_cols]
+        key = (tuple(p_cols), int(spec["window_seconds"]))
+        groups.setdefault(key, []).append(spec)
+    agg_keywords = {"SUM", "COUNT", "AVG", "MIN", "MAX", "AND", "OR", "NOT"}
+    result_df = base_df
+    for (p_cols, window_seconds), spec_list in groups.items():
+        needed_cols = set()
+        for spec in spec_list:
+            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", spec["col_exp"])
+            for t in tokens:
+                if t.upper() not in agg_keywords:
+                    needed_cols.add(t)
+        for c in p_cols:
+            needed_cols.discard(c)
+        b_select_cols = list(dict.fromkeys(list(p_cols) + list(needed_cols)))
+        a_side = base_df.select(functions.col(id_col).alias("a_" + id_col), *[functions.col(c).alias("a_" + c) for c in p_cols], functions.col(ts_long_col).alias("a_ts"))
+        b_side = base_df.select(*[functions.col(c).alias("b_" + c) for c in b_select_cols], functions.col(ts_long_col).alias("b_ts"))
+        join_cond = None
+        for c in p_cols:
+            cond = functions.col("a_" + c) == functions.col("b_" + c)
+            join_cond = cond if join_cond is None else (join_cond & cond)
+        join_cond = join_cond & (functions.col("b_ts") >= functions.col("a_ts") - window_seconds) & (functions.col("b_ts") <= functions.col("a_ts") - 1)
+        joined = a_side.join(b_side, join_cond, "inner")
+        agg_exprs = []
+        for spec in spec_list:
+            rewritten_exp = spec["col_exp"]
+            for c in b_select_cols:
+                rewritten_exp = re.sub(r"\b" + re.escape(c) + r"\b", "b_" + c, rewritten_exp)
+            agg_exprs.append(functions.expr(rewritten_exp).alias(spec["feature_name"]))
+        agg_result = joined.groupBy(functions.col("a_" + id_col).alias(id_col)).agg(*agg_exprs)
+        result_df = result_df.join(agg_result, id_col, "left")
+        not_null_cond = None
+        for c in p_cols:
+            cond = functions.col(c).isNotNull()
+            not_null_cond = cond if not_null_cond is None else (not_null_cond & cond)
+        for spec in spec_list:
+            if spec["col_exp"].strip().upper().startswith("COUNT"):
+                result_df = result_df.withColumn(spec["feature_name"], functions.when(not_null_cond, functions.coalesce(functions.col(spec["feature_name"]), functions.lit(0))).otherwise(functions.lit(None)))
+    result_df = result_df.drop(ts_long_col)
+    if id_col == "_row_id":
+        result_df = result_df.drop(id_col)
+    base_df.unpersist()
+    return result_df
+
+
+    specs = [
+    {
+        "feature_name": "1_HR_MRCH_BAD_PIN_CNT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "SUM(BAD_PIN_ATTMPT_IND)",
+        "window_seconds": 3600
+    },
+    {
+        "feature_name": "1_HR_MRCH_TXN_CNT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "COUNT(TRANS_ID)",
+        "window_seconds": 3600
+    },
+    {
+        "feature_name": "1_HR_MID_CARD_AMT_SUM",
+        "partition_col": ["DRVD_MRCH_ID", "CARD_ID"],
+        "col_exp": "SUM(col1 * col2)",
+        "window_seconds": 3600
+    }
+]
+result = compute_trailing_window_features(df, specs, ts_col="TRANS_DT")

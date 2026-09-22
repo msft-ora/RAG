@@ -1,0 +1,272 @@
+from pyspark.sql import Window
+from pyspark.sql.functions import col, expr, lit, when, sum, count, coalesce, unix_timestamp, min, max
+
+
+def optimized_time_window(df, specs):
+    """
+    Calculate multiple time-based partitioned aggregations without using
+    rangeBetween().
+
+    Parameters
+    ----------
+    df : pyspark.sql.DataFrame
+        Input DataFrame.
+
+    specs : list[dict]
+        Example:
+        [
+            {
+                "feature_name": "1_HR_MRCH_BAD_PIN_CNT",
+                "partition_col": "DRVD_MRCH_ID",
+                "col_exp": "SUM(BAD_PIN_ATTMPT_IND)",
+                "window_seconds": 3600
+            },
+            {
+                "feature_name": "1_HR_MRCH_TXN_CNT",
+                "partition_col": "DRVD_MRCH_ID",
+                "col_exp": "COUNT(other_ind)",
+                "window_seconds": 3600
+            }
+        ]
+
+    Returns
+    -------
+    pyspark.sql.DataFrame
+    """
+
+    result = df
+
+    for spec in specs:
+        feature_name = spec["feature_name"]
+        partition_col = spec["partition_col"]
+        col_exp = spec["col_exp"]
+        window_seconds = int(spec["window_seconds"])
+
+        if isinstance(partition_col, str):
+            partition_cols = [partition_col]
+        else:
+            partition_cols = partition_col
+
+        partition_expr = ", ".join(
+            ["`" + c.replace("`", "``") + "`" for c in partition_cols]
+        )
+
+        value_expr = col_exp.strip()
+
+        if value_expr.upper().startswith("SUM("):
+            aggregation_type = "SUM"
+        elif value_expr.upper().startswith("COUNT("):
+            aggregation_type = "COUNT"
+        else:
+            raise ValueError(
+                "Supported aggregation expressions are SUM(...) and COUNT(...): "
+                + col_exp
+            )
+
+        value_column = "__window_value"
+
+        if aggregation_type == "SUM":
+            inner_expression = value_expr[4:-1].strip()
+
+            working = result.withColumn(
+                value_column,
+                expr(inner_expression).cast("double")
+            )
+
+        elif aggregation_type == "COUNT":
+            inner_expression = value_expr[6:-1].strip()
+
+            if inner_expression == "*":
+                working = result.withColumn(
+                    value_column,
+                    lit(1).cast("double")
+                )
+            else:
+                working = result.withColumn(
+                    value_column,
+                    when(
+                        expr(inner_expression).isNotNull(),
+                        lit(1.0)
+                    ).otherwise(lit(0.0))
+                )
+
+        working = working.withColumn(
+            "__window_ts",
+            unix_timestamp(col("TRANS_DT"))
+        )
+
+        # Remove rows that cannot belong to a partition.
+        working = working.filter(
+            col(partition_cols[0]).isNotNull()
+        )
+
+        # For multiple partition columns, require all partition columns
+        # to be non-null, matching normal PARTITION BY behavior more closely.
+        for partition_column in partition_cols[1:]:
+            working = working.filter(
+                col(partition_column).isNotNull()
+            )
+
+        # Event at transaction time:
+        #   +value
+        #
+        # Event at transaction time + window:
+        #   -value
+        #
+        # Therefore the running balance represents the sum of values whose
+        # expiration time has not yet been reached.
+        starts = working.select(
+            *[col(c) for c in partition_cols],
+            col("__window_ts").alias("__event_ts"),
+            col(value_column).alias("__delta")
+        )
+
+        ends = working.select(
+            *[col(c) for c in partition_cols],
+            (
+                col("__window_ts") + lit(window_seconds)
+            ).alias("__event_ts"),
+            (-col(value_column)).alias("__delta")
+        )
+
+        events = starts.unionByName(ends)
+
+        # Combine all events occurring at exactly the same timestamp.
+        events = (
+            events
+            .groupBy(
+                *[col(c) for c in partition_cols],
+                col("__event_ts")
+            )
+            .agg(
+                sum(col("__delta")).alias("__delta")
+            )
+        )
+
+        # Running event balance.
+        #
+        # This is a ROWS window rather than a RANGE window.
+        # There is exactly one row per partition key + timestamp after
+        # the groupBy above.
+        running_window = (
+            Window
+            .partitionBy(*[col(c) for c in partition_cols])
+            .orderBy(col("__event_ts"))
+            .rowsBetween(
+                Window.unboundedPreceding,
+                Window.currentRow
+            )
+        )
+
+        events = events.withColumn(
+            "__running_value",
+            sum(col("__delta")).over(running_window)
+        )
+
+        # The original expression is:
+        #
+        # RANGE BETWEEN -window_seconds AND -1
+        #
+        # So for a transaction at timestamp T, we need the value immediately
+        # BEFORE the event at T.
+        #
+        # Since events are unique per partition + timestamp, LAG gives us
+        # exactly that value.
+        previous_window = (
+            Window
+            .partitionBy(*[col(c) for c in partition_cols])
+            .orderBy(col("__event_ts"))
+        )
+
+        from pyspark.sql.functions import lag
+
+        events = events.withColumn(
+            "__window_result",
+            lag(col("__running_value"), 1).over(previous_window)
+        )
+
+        # Join result back to the original data.
+        join_conditions = [
+            result[c] == events[c]
+            for c in partition_cols
+        ]
+
+        join_conditions.append(
+            unix_timestamp(result["TRANS_DT"]) == events["__event_ts"]
+        )
+
+        feature_values = (
+            events
+            .select(
+                *[col(c) for c in partition_cols],
+                col("__event_ts"),
+                coalesce(
+                    col("__window_result"),
+                    lit(0.0)
+                ).alias(feature_name)
+            )
+        )
+
+        result = (
+            result
+            .join(
+                feature_values,
+                [
+                    result[c] == feature_values[c]
+                    for c in partition_cols
+                ] + [
+                    unix_timestamp(result["TRANS_DT"]) ==
+                    feature_values["__event_ts"]
+                ],
+                "left"
+            )
+            .drop(
+                *[
+                    feature_values[c]
+                    for c in partition_cols
+                ],
+                feature_values["__event_ts"]
+            )
+        )
+
+        result = result.withColumn(
+            feature_name,
+            when(
+                col(partition_cols[0]).isNotNull(),
+                coalesce(col(feature_name), lit(0.0))
+            )
+        )
+
+    return result
+
+
+
+
+specs = [
+    {
+        "feature_name": "1_HR_MRCH_BAD_PIN_CNT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "SUM(BAD_PIN_ATTMPT_IND)",
+        "window_seconds": 3600
+    },
+    {
+        "feature_name": "1_HR_MRCH_TXN_CNT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "COUNT(other_ind)",
+        "window_seconds": 3600
+    },
+    {
+        "feature_name": "1_HR_MRCH_AMOUNT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "SUM(TRANS_AMT)",
+        "window_seconds": 3600
+    },
+    {
+        "feature_name": "1_HR_MRCH_WEIGHTED_AMT",
+        "partition_col": "DRVD_MRCH_ID",
+        "col_exp": "SUM(TRANS_AMT * WEIGHT)",
+        "window_seconds": 3600
+    }
+]
+
+df_result = optimized_time_window(df, specs)

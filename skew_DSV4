@@ -1,0 +1,69 @@
+import re
+from pyspark.sql import DataFrame, Window
+from pyspark.sql.functions import col, lit, expr, when, coalesce, sum as spark_sum
+
+
+def _parse_agg(col_exp):
+    m = re.match(r"\s*([A-Za-z_]+)\s*$(.*)$\s*$", col_exp.strip())
+    if not m:
+        raise ValueError("cannot parse col_exp: %s" % col_exp)
+    return m.group(1).upper(), m.group(2).strip()
+
+
+def skew_safe_rolling_agg(df, specs, ts_col="TRANS_DT"):
+    out = df.withColumn("__ts", col(ts_col).cast("timestamp").cast("long"))
+    for spec in specs:
+        P = spec["partition_col"]
+        P = [P] if isinstance(P, str) else list(P)
+        W = int(spec["window_seconds"])
+        feat = spec["feature_name"]
+        fn, inner = _parse_agg(spec["col_exp"])
+        if fn == "SUM":
+            val_expr = expr(inner)
+        elif fn == "COUNT":
+            val_expr = lit(1) if inner == "*" else when(col(inner).isNotNull(), lit(1)).otherwise(lit(0))
+        else:
+            raise ValueError("unsupported aggregate: %s" % fn)
+        base = out.withColumn("__bucket", (col("__&#8203;ts") / W).cast("long")).withColumn("__v", val_expr)
+        g = (base.filter(col("__ts").isNotNull())
+                 .groupBy(*P, "__bucket", "__&#8203;ts")
+                 .agg(spark_sum("__v").alias("__&#8203;v"))
+                 .repartition(*P, "__bucket"))
+        w = Window.partitionBy(*P, "__bucket").orderBy("__&#8203;ts").rowsBetween(Window.unboundedPreceding, -1)
+        curr = g.withColumn("__same", spark_sum("__&#8203;v").over(w))
+        prev = curr.select(*[col(c).alias("prev_" + c) for c in P],
+                           col("__bucket").alias("prev_bucket"),
+                           col("__ts").alias("prev_ts"),
+                           col("__v").alias("prev_v"))
+        prev = prev.withColumn("__b2", col("prev_bucket") + 1)
+        cond = [col(c) == col("prev_" + c) for c in P] + [col("__bucket") == col("__&#8203;b2")]
+        j = curr.join(prev, cond, "left")
+        j = j.filter((col("prev_ts") >= col("__ts") - W) | col("prev_ts").isNull())
+        r = (j.groupBy(*P, "__bucket", "__&#8203;ts", "__same")
+              .agg(coalesce(spark_sum("prev_v"), lit(0)).alias("__prev")))
+        r = r.select(*[col(c) for c in P],
+                     col("__ts").alias("__&#8203;ts_r"),
+                     (coalesce(col("__same"), lit(0)) + col("__&#8203;prev")).alias(feat))
+        out = (out.alias("o").join(r.alias("r"),
+                                   [col("o." + c) == col("r." + c) for c in P] + [col("o.__ts") == col("r.__ts_r")],
+                                   "left")
+               .select("o.*", "r." + feat))
+    return out.drop("__ts")
+
+
+
+specs = [
+    {"feature_name": "1_HR_MRCH_BAD_PIN_CNT",
+     "partition_col": "DRVD_MRCH_ID",
+     "col_exp": "SUM(BAD_PIN_ATTMPT_IND)",
+     "window_seconds": 3600},
+    {"feature_name": "30M_MULTI_CNT",
+     "partition_col": ["DRVD_MRCH_ID", "MERCH_REGION"],
+     "col_exp": "COUNT(other_ind)",
+     "window_seconds": 1800},
+    {"feature_name": "2H_REV_SUM",
+     "partition_col": "DRVD_MRCH_ID",
+     "col_exp": "SUM(qty * unit_price)",
+     "window_seconds": 7200},
+]
+df = skew_safe_rolling_agg(df, specs)
