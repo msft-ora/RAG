@@ -1,54 +1,34 @@
-from datetime import datetime, timedelta
-from pyspark.sql import SparkSession
+
 from pyspark.sql.functions import (col, concat_ws, sort_array, collect_list, count,
                                    lit, to_date, date_format, xxhash64, sha2)
-
-
-def compute_partition_checksum(params):
-    """xxhash64 + sha2(256) partition checksum.
-    Per-row: xxhash64(*all_columns) — NULL-safe natively, no concat_ws needed.
-    Final:   sha2-256 of sorted row-hash strings concatenated.
-    params = [schema_name, table_name, partition_date_col, start_date,
-              end_date, level, table_filter]
-      - level:        'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd)
-      - table_filter: SQL condition string (without WHERE), or None
-    Returns list of (partition_key, checksum_sha256, row_count).
+def compute_partition_checksum(schema_name, table_name, partition_date_col,
+                               start_date, end_date, table_filter=None, checksum_level="m"):
+    """xxhash64 + sha2(256) partition checksum — returns a DataFrame.
+    Single-pass groupBy, no Python loop.
+    Per-row: xxhash64(*all_columns) — NULL-safe natively.
+    Final:   sha2-256 of sorted row-hash strings concatenated within each period.
+      - table_filter:   SQL condition string (without WHERE), default None
+      - checksum_level: 'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd), default 'm'
+    Returns DataFrame with columns: period, checksum, row_count, checksum_level.
     """
-    schema_name, table_name, pcol, start_date, end_date, level, table_filter = params
     base_df = spark.table(f"{schema_name}.{table_name}")
-
-    def _add_months(d, n):
-        m = d.month - 1 + n
-        return d.replace(year=d.year + m // 12, month=m % 12 + 1, day=1)
-
-    keys, cur, end = [], datetime.strptime(start_date, "%Y-%m-%d"), datetime.strptime(end_date, "%Y-%m-%d")
-    if level == "m":
-        cur = cur.replace(day=1)
-        while cur <= end:
-            keys.append(cur.strftime("%Y-%m"))
-            cur = _add_months(cur, 1)
-    elif level == "d":
-        while cur <= end:
-            keys.append(cur.strftime("%Y-%m-%d"))
-            cur += timedelta(days=1)
+    pcol = partition_date_col
+    dt_col = to_date(col(pcol))
+    if checksum_level == "m":
+        period_col = date_format(dt_col, "yyyy-MM")
+    elif checksum_level == "d":
+        period_col = date_format(dt_col, "yyyy-MM-dd")
     else:
-        raise ValueError(f"level must be 'm' or 'd', got '{level}'")
-
-    results = []
-    for k in keys:
-        pfilt = (date_format(to_date(col(pcol)), "yyyy-MM") == lit(k)
-                 if level == "m"
-                 else to_date(col(pcol)) == to_date(lit(k)))
-        df = base_df.filter(pfilt)
-        if table_filter:
-            df = df.filter(table_filter)
-        cols = sorted(df.columns)
-        r = (df.withColumn("_rh", xxhash64(*[col(c) for c in cols]).cast("string"))
-               .agg(count(lit(1)).alias("row_count"),
-                    sha2(concat_ws("", sort_array(collect_list("_rh"))), 256).alias("checksum"))
-               .collect()[0])
-        results.append((k, r["checksum"], r["row_count"]))
-    return results
-
-
-res = compute_partition_checksum(["db1", "orders", "dt", "2024-01-01", "2024-03-31", "m", None])
+        raise ValueError(f"checksum_level must be 'm' or 'd', got '{checksum_level}'")
+    df = base_df.withColumn("period", period_col).filter(
+        dt_col >= to_date(lit(start_date))).filter(dt_col <= to_date(lit(end_date)))
+    if table_filter:
+        df = df.filter(table_filter)
+    cols = sorted(c for c in df.columns if c != "period")
+    return (df.withColumn("_rh", xxhash64(*[col(c) for c in cols]).cast("string"))
+              .groupBy("period")
+              .agg(count(lit(1)).alias("row_count"),
+                   sha2(concat_ws("", sort_array(collect_list("_rh"))), 256).alias("checksum"))
+              .withColumn("checksum_level", lit(checksum_level))
+              .select("period", "checksum", "row_count", "checksum_level")
+              .orderBy("period"))
