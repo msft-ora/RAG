@@ -1,4 +1,3 @@
-
 from pyspark.sql.functions import (col, concat_ws, sort_array, collect_list, count,
                                    lit, to_date, date_format, xxhash64, sha2)
 def compute_partition_checksum(schema_name, table_name, partition_date_col,
@@ -9,7 +8,7 @@ def compute_partition_checksum(schema_name, table_name, partition_date_col,
     Final:   sha2-256 of sorted row-hash strings concatenated within each period.
       - table_filter:   SQL condition string (without WHERE), default None
       - checksum_level: 'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd), default 'm'
-    Returns DataFrame with columns: period, checksum, row_count, checksum_level.
+    Returns DataFrame with columns: period, checksum_<schema>_<table>_<level>, row_count.
     """
     base_df = spark.table(f"{schema_name}.{table_name}")
     pcol = partition_date_col
@@ -25,10 +24,10 @@ def compute_partition_checksum(schema_name, table_name, partition_date_col,
     if table_filter:
         df = df.filter(table_filter)
     cols = sorted(c for c in df.columns if c != "period")
+    checksum_col = f"checksum_{schema_name}_{table_name}_{checksum_level}"
     return (df.withColumn("_rh", xxhash64(*[col(c) for c in cols]).cast("string"))
               .groupBy("period")
               .agg(count(lit(1)).alias("row_count"),
-                   sha2(concat_ws("", sort_array(collect_list("_rh"))), 256).alias("checksum"))
-              .withColumn("checksum_level", lit(checksum_level))
-              .select("period", "checksum", "row_count", "checksum_level")
+                   sha2(concat_ws("", sort_array(collect_list("_rh"))), 256).alias(checksum_col))
+              .select("period", checksum_col, "row_count")
               .orderBy("period"))
