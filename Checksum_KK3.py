@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
 from pyspark.sql.functions import (col, concat_ws, sort_array, collect_list, count,
                                    lit, to_date, date_format, xxhash64, sha2)
 
 
-def compute_partition_checksum(spark, params):
+def compute_partition_checksum(params):
     """xxhash64 + sha2(256) partition checksum.
     Per-row: xxhash64(*all_columns) — NULL-safe natively, no concat_ws needed.
     Final:   sha2-256 of sorted row-hash strings concatenated.
@@ -48,3 +49,6 @@ def compute_partition_checksum(spark, params):
                .collect()[0])
         results.append((k, r["checksum"], r["row_count"]))
     return results
+
+
+res = compute_partition_checksum(["db1", "orders", "dt", "2024-01-01", "2024-03-31", "m", None])
