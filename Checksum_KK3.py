@@ -12,7 +12,7 @@ def compute_partition_checksum(params):
       - checksum_level: 'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd)
     Returns DataFrame with columns: period, checksum_<schema>_<table>[_<level>][_<filter>], row_count.
     """
-    p = (list(params) + [None, None, None, None, None, "m"])[:7]
+    p = list(params) + [None, None, None, None, None, None, "m"][len(params):]
     schema_name, table_name, partition_date_col, start_date, end_date, table_filter, checksum_level = p
     filter_suffix = "".join(c if c.isalnum() else "_" for c in table_filter).strip("_") if table_filter else ""
     base_df = spark.table(f"{schema_name}.{table_name}")
