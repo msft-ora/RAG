@@ -1,15 +1,19 @@
 from pyspark.sql.functions import (col, concat_ws, sort_array, collect_list, count,
                                    lit, to_date, date_format, xxhash64, sha2)
-def compute_partition_checksum(schema_name, table_name, partition_date_col=None,
-                               start_date=None, end_date=None, table_filter=None, checksum_level="m"):
+def compute_partition_checksum(params):
     """xxhash64 + sha2(256) checksum — returns a DataFrame.
-    - Table-level:     only schema_name + table_name → single checksum for the whole table.
+    params = [schema_name, table_name, partition_date_col, start_date,
+              end_date, table_filter, checksum_level]
+    - Required:     schema_name, table_name
+    - Optional:     partition_date_col (None), start_date (None), end_date (None),
+                    table_filter (None), checksum_level ("m")
+    - Table-level:  only schema_name + table_name → single checksum for the whole table.
     - Partition-level: partition_date_col provided → per-period checksum.
-      - start_date/end_date: optional date range filter (only used with partition_date_col)
-      - table_filter:   SQL condition string (without WHERE), default None
-      - checksum_level: 'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd), default 'm'
+      - checksum_level: 'm' for month (yyyy-MM) or 'd' for day (yyyy-MM-dd)
     Returns DataFrame with columns: period, checksum_<schema>_<table>[_<level>][_<filter>], row_count.
     """
+    p = (list(params) + [None, None, None, None, None, "m"])[:7]
+    schema_name, table_name, partition_date_col, start_date, end_date, table_filter, checksum_level = p
     filter_suffix = "".join(c if c.isalnum() else "_" for c in table_filter).strip("_") if table_filter else ""
     base_df = spark.table(f"{schema_name}.{table_name}")
     if table_filter:
@@ -24,8 +28,7 @@ def compute_partition_checksum(schema_name, table_name, partition_date_col=None,
                        sha2(concat_ws("", sort_array(collect_list("_rh"))), 256).alias(checksum_col))
                   .withColumn("period", lit("ALL"))
                   .select("period", checksum_col, "row_count"))
-    pcol = partition_date_col
-    dt_col = to_date(col(pcol))
+    dt_col = to_date(col(partition_date_col))
     if checksum_level == "m":
         period_col = date_format(dt_col, "yyyy-MM")
     elif checksum_level == "d":
